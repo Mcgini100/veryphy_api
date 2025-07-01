@@ -61,6 +61,18 @@ app.include_router(
     tags=["verification"]
 )
 
+# Add ledger routes if the ledger module exists
+try:
+    from app.routes import ledger
+    app.include_router(
+        ledger.router,
+        prefix=f"{settings.api_prefix}/ledger",
+        tags=["ledger"]
+    )
+    logger.info("Ledger routes added successfully")
+except ImportError:
+    logger.warning("Ledger routes not available - ledger.py not found")
+
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
     """Handle ValueError exceptions."""
