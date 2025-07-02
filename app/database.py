@@ -73,132 +73,108 @@ class ImmutableLedger:
     
     def _calculate_hash(self, entry_data: Dict[str, Any]) -> str:
         """Calculate SHA-256 hash of entry data."""
-        # Create deterministic string representation
-        hash_data = {
-            "transaction_id": entry_data["transaction_id"],
-            "timestamp": entry_data["timestamp"],
-            "transaction_type": entry_data["transaction_type"],
-            "certificate_number": entry_data["certificate_number"],
-            "data": entry_data["data"],
-            "previous_hash": entry_data["previous_hash"],
-            "block_number": entry_data["block_number"]
-        }
-        
-        # Ensure transaction_type is a string for consistent hashing
-        if hasattr(hash_data["transaction_type"], 'value'):
-            hash_data["transaction_type"] = hash_data["transaction_type"].value
-        
-        hash_string = json.dumps(hash_data, sort_keys=True, separators=(',', ':'))
-        return hashlib.sha256(hash_string.encode()).hexdigest()
+        serialized = json.dumps(entry_data, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode()).hexdigest()
     
     async def _load_ledger(self) -> List[LedgerEntry]:
-        """Load all entries from the ledger."""
+        """Load all ledger entries from file."""
         try:
             with open(self.ledger_path, 'r') as f:
-                raw_entries = json.load(f)
+                entries_data = json.load(f)
             
             entries = []
-            for entry_data in raw_entries:
-                entries.append(LedgerEntry(**entry_data))
+            for entry_data in entries_data:
+                try:
+                    # Handle both old and new formats
+                    if isinstance(entry_data.get('transaction_type'), str):
+                        entry_data['transaction_type'] = TransactionType(entry_data['transaction_type'])
+                    
+                    entries.append(LedgerEntry(**entry_data))
+                except (TypeError, ValueError) as e:
+                    print(f"Warning: Skipping invalid ledger entry: {e}")
+                    continue
             
             return entries
-        except (json.JSONDecodeError, FileNotFoundError):
+        except (FileNotFoundError, json.JSONDecodeError):
             return []
     
     async def _save_ledger(self, entries: List[LedgerEntry]):
-        """Save all entries to the ledger."""
-        # Create backup before saving
-        backup_path = f"{self.ledger_path}.backup"
-        if os.path.exists(self.ledger_path):
-            with open(self.ledger_path, 'r') as f:
-                backup_data = f.read()
-            with open(backup_path, 'w') as f:
-                f.write(backup_data)
-        
-        # Convert entries to dict format for JSON serialization
+        """Save all ledger entries to file."""
         entries_data = []
         for entry in entries:
             entry_dict = asdict(entry)
-            # Ensure transaction_type is stored as string value, not enum representation
-            if isinstance(entry_dict['transaction_type'], TransactionType):
-                entry_dict['transaction_type'] = entry_dict['transaction_type'].value
-            elif hasattr(entry_dict['transaction_type'], 'value'):
-                entry_dict['transaction_type'] = entry_dict['transaction_type'].value
+            # Ensure transaction_type is serialized as string
+            entry_dict['transaction_type'] = entry.transaction_type.value
             entries_data.append(entry_dict)
         
-        # Save new data
         with open(self.ledger_path, 'w') as f:
             json.dump(entries_data, f, indent=2, default=str)
     
-    async def _get_last_entry(self) -> Optional[LedgerEntry]:
-        """Get the last entry in the ledger."""
-        entries = await self._load_ledger()
-        return entries[-1] if entries else None
-    
-    async def _validate_chain(self, entries: List[LedgerEntry]) -> bool:
-        """Validate the integrity of the entire ledger chain."""
-        if not entries:
-            return True
-        
-        # Check genesis block
-        first_entry = entries[0]
-        if first_entry.previous_hash != self._genesis_hash:
-            return False
-        
-        # Validate each subsequent entry
-        for i in range(1, len(entries)):
-            current_entry = entries[i]
-            previous_entry = entries[i - 1]
-            
-            # Check if previous hash matches
-            if current_entry.previous_hash != previous_entry.current_hash:
-                return False
-            
-            # Check if block numbers are sequential
-            if current_entry.block_number != previous_entry.block_number + 1:
-                return False
-            
-            # Verify hash integrity
-            entry_dict = asdict(current_entry)
-            expected_hash = self._calculate_hash(entry_dict)
-            if current_entry.current_hash != expected_hash:
-                return False
-        
-        return True
-    
     async def _create_entry(
-        self,
+        self, 
         transaction_type: TransactionType,
-        certificate_number: str,
+        cert_number: str,
         data: Dict[str, Any]
     ) -> LedgerEntry:
         """Create a new ledger entry."""
-        last_entry = await self._get_last_entry()
+        entries = await self._load_ledger()
         
-        # Determine previous hash and block number
-        if last_entry:
-            previous_hash = last_entry.current_hash
-            block_number = last_entry.block_number + 1
-        else:
-            previous_hash = self._genesis_hash
-            block_number = 0
+        # Calculate previous hash
+        previous_hash = entries[-1].current_hash if entries else self._genesis_hash
         
-        # Create entry without hash first
+        # Create entry data for hashing
         entry_data = {
             "transaction_id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "transaction_type": transaction_type.value,
-            "certificate_number": certificate_number,
+            "certificate_number": cert_number,
             "data": data,
             "previous_hash": previous_hash,
-            "block_number": block_number
+            "block_number": len(entries)
         }
         
-        # Calculate hash
+        # Calculate current hash
         current_hash = self._calculate_hash(entry_data)
         entry_data["current_hash"] = current_hash
         
         return LedgerEntry(**entry_data)
+    
+    async def _validate_chain(self, entries: List[LedgerEntry]) -> bool:
+        """Validate the integrity of the ledger chain."""
+        if not entries:
+            return True
+        
+        # Check genesis
+        if entries[0].previous_hash != self._genesis_hash:
+            return False
+        
+        # Validate each entry
+        for i, entry in enumerate(entries):
+            # Check block number sequence
+            if entry.block_number != i:
+                return False
+            
+            # Check hash chain
+            if i > 0:
+                if entry.previous_hash != entries[i-1].current_hash:
+                    return False
+            
+            # Recalculate and verify current hash
+            entry_data = {
+                "transaction_id": entry.transaction_id,
+                "timestamp": entry.timestamp,
+                "transaction_type": entry.transaction_type.value,
+                "certificate_number": entry.certificate_number,
+                "data": entry.data,
+                "previous_hash": entry.previous_hash,
+                "block_number": entry.block_number
+            }
+            
+            expected_hash = self._calculate_hash(entry_data)
+            if entry.current_hash != expected_hash:
+                return False
+        
+        return True
     
     async def add_certificate(
         self, 
@@ -206,6 +182,7 @@ class ImmutableLedger:
         cert_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Add a new certificate to the ledger."""
+        
         async with self._lock:
             # Check if certificate already exists
             existing = await self.get_certificate(cert_number)
@@ -250,10 +227,11 @@ class ImmutableLedger:
         """Get the latest version of a certificate."""
         entries = await self._load_ledger()
         
-        # Find the latest non-deleted entry for this certificate
+        # ✅ FIX: Find the latest CREATE or UPDATE entry for this certificate (not VERIFY)
         latest_entry = None
         for entry in reversed(entries):
-            if entry.certificate_number == cert_number:
+            if (entry.certificate_number == cert_number and 
+                entry.transaction_type in [TransactionType.CREATE, TransactionType.UPDATE]):
                 latest_entry = entry
                 break
         
@@ -268,15 +246,17 @@ class ImmutableLedger:
         cert_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Update an existing certificate."""
+        
         async with self._lock:
-            # Get current certificate
+            # Get current certificate data
             current = await self.get_certificate(cert_number)
             if not current:
                 raise ValueError(f"Certificate {cert_number} not found")
             
-            # Increment version and update metadata
-            cert_data.update({
-                "created_at": current["created_at"],
+            # ✅ FIX: Preserve original created_at and increment version
+            updated_data = cert_data.copy()
+            updated_data.update({
+                "created_at": current.get("created_at", datetime.now(timezone.utc).isoformat()),  # Preserve original
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "deleted": False,
                 "version": current.get("version", 1) + 1
@@ -286,7 +266,7 @@ class ImmutableLedger:
             entry = await self._create_entry(
                 TransactionType.UPDATE,
                 cert_number,
-                cert_data
+                updated_data
             )
             
             # Load existing entries and append new one
@@ -305,11 +285,12 @@ class ImmutableLedger:
                 "certificate_number": cert_number,
                 "block_number": entry.block_number,
                 "hash": entry.current_hash,
-                "data": cert_data
+                "data": updated_data
             }
     
     async def delete_certificate(self, cert_number: str) -> Dict[str, Any]:
-        """Mark a certificate as deleted (soft delete)."""
+        """Soft delete a certificate (maintains history)."""
+        
         async with self._lock:
             # Get current certificate
             current = await self.get_certificate(cert_number)
@@ -360,54 +341,45 @@ class ImmutableLedger:
         """List certificates with pagination and search."""
         entries = await self._load_ledger()
         
-        # Build current state of all certificates
+        # Get latest version of each certificate
         certificates = {}
         for entry in entries:
-            cert_num = entry.certificate_number
-            if cert_num not in certificates or entry.block_number > certificates[cert_num]["block_number"]:
-                certificates[cert_num] = {
-                    "certificate_number": cert_num,
+            if entry.transaction_type in [TransactionType.CREATE, TransactionType.UPDATE, TransactionType.DELETE]:
+                certificates[entry.certificate_number] = {
+                    "certificate_number": entry.certificate_number,
                     "data": entry.data,
                     "block_number": entry.block_number,
                     "transaction_id": entry.transaction_id,
-                    "hash": entry.current_hash
+                    "timestamp": entry.timestamp
                 }
         
-        # Filter out deleted certificates if needed
-        if not include_deleted:
-            certificates = {
-                k: v for k, v in certificates.items() 
-                if not v["data"].get("deleted", False)
-            }
+        # Filter certificates
+        filtered_certs = []
+        for cert in certificates.values():
+            # Skip deleted unless specifically requested
+            if not include_deleted and cert["data"].get("deleted", False):
+                continue
+            
+            # Apply search filter
+            if search:
+                search_text = json.dumps(cert["data"], default=str).lower()
+                if search.lower() not in search_text:
+                    continue
+            
+            filtered_certs.append(cert)
         
-        # Apply search filter
-        if search:
-            search_lower = search.lower()
-            filtered_certs = {}
-            for cert_num, cert_info in certificates.items():
-                # Search in certificate number and data
-                searchable_text = f"{cert_num} {json.dumps(cert_info['data'])}".lower()
-                if search_lower in searchable_text:
-                    filtered_certs[cert_num] = cert_info
-            certificates = filtered_certs
-        
-        # Sort by block number (newest first)
-        sorted_certs = sorted(
-            certificates.values(),
-            key=lambda x: x["block_number"],
-            reverse=True
-        )
+        # Sort by timestamp (newest first)
+        filtered_certs.sort(key=lambda x: x["timestamp"], reverse=True)
         
         # Apply pagination
-        total_count = len(sorted_certs)
-        paginated_certs = sorted_certs[offset:offset + limit]
+        total_count = len(filtered_certs)
+        paginated_certs = filtered_certs[offset:offset + limit]
         
         return {
             "certificates": paginated_certs,
             "total_count": total_count,
             "limit": limit,
-            "offset": offset,
-            "has_more": offset + limit < total_count
+            "offset": offset
         }
     
     async def get_certificate_history(self, cert_number: str) -> List[Dict[str, Any]]:
@@ -426,7 +398,52 @@ class ImmutableLedger:
                     "data": entry.data
                 })
         
-        return sorted(history, key=lambda x: x["block_number"])
+        return history
+    
+    async def add_verification_record(
+        self, 
+        cert_number: str, 
+        verification_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Add a verification record for an existing certificate."""
+        
+        async with self._lock:
+            # Check if certificate exists (using the fixed get_certificate method)
+            existing_cert = await self.get_certificate(cert_number)
+            if not existing_cert:
+                raise ValueError(f"Certificate {cert_number} not found")
+            
+            # Create verification entry
+            verify_data = {
+                "verification_timestamp": datetime.now(timezone.utc).isoformat(),
+                "verification_result": verification_data,
+                "verified_by": verification_data.get("verified_by", "system")
+            }
+            
+            entry = await self._create_entry(
+                TransactionType.VERIFY,
+                cert_number,
+                verify_data
+            )
+            
+            # Load existing entries and append new one
+            entries = await self._load_ledger()
+            entries.append(entry)
+            
+            # Validate chain before saving
+            if not await self._validate_chain(entries):
+                raise ValueError("Ledger chain validation failed")
+            
+            # Save updated ledger
+            await self._save_ledger(entries)
+            
+            return {
+                "transaction_id": entry.transaction_id,
+                "certificate_number": cert_number,
+                "block_number": entry.block_number,
+                "hash": entry.current_hash,
+                "verification_data": verify_data
+            }
     
     async def verify_certificate(
         self, 
@@ -434,6 +451,7 @@ class ImmutableLedger:
         verification_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Record a certificate verification attempt."""
+        
         async with self._lock:
             # Create verification entry
             verify_data = {
@@ -540,6 +558,15 @@ class CertificateDatabase:
         """List certificates from the ledger."""
         return await self.ledger.list_certificates(limit, offset, search)
     
+    # ✅ FIX: Add the missing add_verification_record method
+    async def add_verification_record(
+        self, 
+        cert_number: str, 
+        verification_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Add a verification record for an existing certificate."""
+        return await self.ledger.add_verification_record(cert_number, verification_data)
+    
     # Additional methods specific to the ledger
     async def get_certificate_history(self, cert_number: str) -> List[Dict[str, Any]]:
         """Get complete transaction history for a certificate."""
@@ -601,156 +628,36 @@ class CertificateDatabase:
         
         return verification_history
 
-
+    # ✅ FIX: Additional helper methods for better compatibility
     async def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive statistics about certificates and ledger."""
+        """Get database statistics."""
         try:
-            # Get ledger integrity and stats
-            integrity_result = await self.ledger.validate_ledger_integrity()
+            integrity = await self.validate_integrity()
             
-            # Get all certificates for detailed statistics
-            certificates_result = await self.ledger.list_certificates(limit=1000, offset=0)
-            all_certificates = certificates_result.get('certificates', [])
+            # Get all certificates to calculate status distribution
+            all_certs = await self.get_all_certificates(limit=1000)
             
-            # Initialize counters
-            total_certificates = len(all_certificates)
-            active_certificates = 0
-            deleted_certificates = 0
-            verified_certificates = 0
-            failed_certificates = 0
-            pending_certificates = 0
+            status_distribution = {}
+            for cert in all_certs:
+                status = cert.get('verification_status', 'UNKNOWN')
+                status_distribution[status] = status_distribution.get(status, 0) + 1
             
-            # Certificate type distribution
-            degree_types = {}
-            faculties = {}
-            verification_methods = {}
-            
-            # Process each certificate
-            for cert_entry in all_certificates:
-                cert_data = cert_entry.get('data', {})
-                
-                # Count by status
-                if cert_data.get('deleted', False):
-                    deleted_certificates += 1
-                else:
-                    active_certificates += 1
-                
-                # Count by verification status
-                verification_status = cert_data.get('verification_status', 'pending')
-                if verification_status in ['VERIFIED', 'VERIFIED_BY_DATA']:
-                    verified_certificates += 1
-                elif verification_status in ['FAILED', 'CORRUPTED_HASH']:
-                    failed_certificates += 1
-                else:
-                    pending_certificates += 1
-                
-                # Collect degree types
-                degree_name = cert_data.get('Degree Name', 'Unknown')
-                degree_types[degree_name] = degree_types.get(degree_name, 0) + 1
-                
-                # Collect faculties
-                faculty_name = cert_data.get('Faculty Name', 'Unknown')
-                faculties[faculty_name] = faculties.get(faculty_name, 0) + 1
-                
-                # Collect verification methods
-                verification_method = cert_data.get('verification_method', 'hash_verification')
-                verification_methods[verification_method] = verification_methods.get(verification_method, 0) + 1
-            
-            # Calculate success rate
-            total_verified_attempts = verified_certificates + failed_certificates
-            success_rate = (verified_certificates / total_verified_attempts * 100) if total_verified_attempts > 0 else 0
-            
-            # Get recent activity (certificates added in last 30 days)
-            import datetime
-            thirty_days_ago = (datetime.datetime.now() - datetime.timedelta(days=30)).isoformat()
-            recent_uploads = 0
-            
-            for cert_entry in all_certificates:
-                cert_timestamp = cert_entry.get('timestamp', '')
-                if cert_timestamp > thirty_days_ago:
-                    recent_uploads += 1
-            
-            # Compile comprehensive statistics
-            statistics = {
-                "overview": {
-                    "total_certificates": total_certificates,
-                    "active_certificates": active_certificates,
-                    "deleted_certificates": deleted_certificates,
-                    "recent_uploads": recent_uploads
-                },
-                "verification_stats": {
-                    "verified": verified_certificates,
-                    "failed": failed_certificates,
-                    "pending": pending_certificates,
-                    "success_rate": round(success_rate, 2)
-                },
-                "ledger_stats": {
-                    "total_entries": integrity_result.get('total_entries', 0),
-                    "unique_certificates": integrity_result.get('unique_certificates', 0),
-                    "last_block_number": integrity_result.get('last_block_number', -1),
-                    "is_valid": integrity_result.get('is_valid', False),
-                    "transaction_types": integrity_result.get('transaction_types', {})
-                },
-                "distribution": {
-                    "degree_types": dict(list(degree_types.items())[:10]),  # Top 10
-                    "faculties": dict(list(faculties.items())[:10]),  # Top 10
-                    "verification_methods": verification_methods
-                },
-                "performance": {
-                    "average_confidence": 0.85,  # This would need calculation from actual data
-                    "processing_efficiency": "98.5%",  # This would need calculation
-                    "ledger_integrity": "Valid" if integrity_result.get('is_valid', False) else "Invalid"
-                }
-            }
-            
-            return statistics
-            
-        except Exception as e:
-            print(f"Error getting statistics: {e}")
-            # Return minimal statistics if there's an error
             return {
-                "overview": {
-                    "total_certificates": 0,
-                    "active_certificates": 0,
-                    "deleted_certificates": 0,
-                    "recent_uploads": 0
-                },
-                "verification_stats": {
-                    "verified": 0,
-                    "failed": 0,
-                    "pending": 0,
-                    "success_rate": 0
-                },
-                "ledger_stats": {
-                    "total_entries": 0,
-                    "unique_certificates": 0,
-                    "last_block_number": -1,
-                    "is_valid": False,
-                    "transaction_types": {}
-                },
-                "distribution": {
-                    "degree_types": {},
-                    "faculties": {},
-                    "verification_methods": {}
-                },
-                "performance": {
-                    "average_confidence": 0,
-                    "processing_efficiency": "0%",
-                    "ledger_integrity": "Invalid"
-                }
+                'total_certificates': len(all_certs),
+                'total_verifications': integrity.get('total_entries', 0),
+                'status_distribution': status_distribution,
+                'database_size_bytes': 0,  # Placeholder for compatibility
+                'unique_certificates': integrity.get('unique_certificates', 0)
+            }
+        except Exception as e:
+            return {
+                'total_certificates': 0,
+                'total_verifications': 0,
+                'status_distribution': {},
+                'database_size_bytes': 0,
+                'error': str(e)
             }
 
-    async def add_verification_record(self, cert_number: str, verification_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Add a verification record to the ledger."""
-        try:
-            return await self.ledger.verify_certificate(cert_number, verification_data)
-        except Exception as e:
-            print(f"Error adding verification record: {e}")
-            return {
-                "transaction_id": f"verify_{cert_number}_{int(time.time())}",
-                "certificate_number": cert_number,
-                "verification_data": verification_data,
-                "recorded_at": datetime.now(timezone.utc).isoformat()
-            }
+
 # Create a global database instance for backward compatibility
 db = CertificateDatabase()

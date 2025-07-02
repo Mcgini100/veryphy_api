@@ -1,5 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Form
 from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks
+import tempfile
 from typing import Optional, List
 import os
 import shutil
@@ -330,6 +332,9 @@ async def add_watermark_to_certificate(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# app/routes/certificates.py - Fixed download endpoint
+# app/routes/certificates.py - SIMPLE FIX
+
 @router.get("/{certificate_number}/download/processed")
 async def download_processed_certificate(
     certificate_number: str,
@@ -337,7 +342,7 @@ async def download_processed_certificate(
     format: str = Query("png", description="Output format")
 ):
     """Download the processed certificate with visual markers."""
-    print(f"Download processed request for: {certificate_number}")
+    print(f"Download processed request for: {certificate_number}, format: {format}")
     
     certificate = await db.get_certificate(certificate_number)
     if not certificate:
@@ -349,11 +354,13 @@ async def download_processed_certificate(
         processed_path = os.path.join(settings.processed_dir, processed_filename)
         if os.path.exists(processed_path):
             print(f"Serving existing processed file: {processed_path}")
+            
+            # ✅ SIMPLE FIX: Always serve as PNG with correct headers
             return FileResponse(
                 processed_path,
-                media_type=f"image/{format}",
-                filename=f"{certificate_number}_with_markers.{format}",
-                headers={"Content-Disposition": f"attachment; filename={certificate_number}_with_markers.{format}"}
+                media_type="image/png",  # ✅ Fixed: Always PNG
+                filename=f"{certificate_number}_with_markers.png",  # ✅ Fixed: Always PNG extension
+                headers={"Content-Disposition": f"attachment; filename={certificate_number}_with_markers.png"}
             )
     
     # If no processed file exists, create one
@@ -373,11 +380,12 @@ async def download_processed_certificate(
         if not cert_hash:
             cert_hash = hash_service.generate_certificate_hash(source_path)
         
-        # Create processed version
-        processed_filename = f"embedded_{source_image}"
+        # ✅ FIXED: Always create as PNG with .png extension
+        base_name = os.path.splitext(source_image)[0]
+        processed_filename = f"embedded_{base_name}.png"
         processed_path = os.path.join(settings.processed_dir, processed_filename)
         
-        # Use your existing embed_hash_on_certificate function
+        # Use your existing embed_hash_on_certificate function (already creates PNG)
         await hash_service.embed_hash_on_certificate(
             source_path,
             cert_hash,
@@ -394,16 +402,63 @@ async def download_processed_certificate(
         
         print(f"Created and saved processed file: {processed_path}")
         
+        # ✅ FIXED: Always serve as PNG with correct headers
         return FileResponse(
             processed_path,
-            media_type=f"image/{format}",
-            filename=f"{certificate_number}_with_markers.{format}",
-            headers={"Content-Disposition": f"attachment; filename={certificate_number}_with_markers.{format}"}
+            media_type="image/png",  # ✅ Fixed: Always PNG
+            filename=f"{certificate_number}_with_markers.png",  # ✅ Fixed: Always PNG extension
+            headers={"Content-Disposition": f"attachment; filename={certificate_number}_with_markers.png"}
         )
         
     except Exception as e:
         print(f"Error creating processed version: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate processed version: {str(e)}")
+
+
+# ✅ ALSO FIX: Original download endpoint
+@router.get("/{certificate_number}/download/original")
+async def download_original_certificate(
+    certificate_number: str,
+    format: str = Query("png", description="Output format")  # Keep parameter for API compatibility
+):
+    """Download the original certificate."""
+    print(f"Download original request for: {certificate_number}")
+    
+    certificate = await db.get_certificate(certificate_number)
+    if not certificate:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    
+    source_image = certificate.get('source_image')
+    if not source_image:
+        raise HTTPException(status_code=400, detail="No source image found")
+    
+    source_path = os.path.join(settings.upload_dir, source_image)
+    if not os.path.exists(source_path):
+        raise HTTPException(status_code=404, detail="Source image not found")
+    
+    # ✅ FIXED: Determine actual file type and serve correctly
+    file_extension = os.path.splitext(source_image)[1].lower()
+    
+    if file_extension == '.png':
+        media_type = "image/png"
+        filename = f"{certificate_number}_original.png"
+    elif file_extension in ['.jpg', '.jpeg']:
+        media_type = "image/jpeg"
+        filename = f"{certificate_number}_original.jpg"
+    elif file_extension == '.pdf':
+        media_type = "application/pdf"
+        filename = f"{certificate_number}_original.pdf"
+    else:
+        # Default to PNG for unknown types
+        media_type = "image/png"
+        filename = f"{certificate_number}_original.png"
+    
+    return FileResponse(
+        source_path,
+        media_type=media_type,
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @router.get("/stats/summary")
 async def get_statistics():
